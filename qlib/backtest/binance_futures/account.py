@@ -26,6 +26,7 @@ class Account:
     init_balance: float
     vip_level: int = 0
     hedge_mode: bool = False
+    default_leverage: float = 1.0
 
     balance: float = field(init=False)
     used_margin: float = field(init=False)
@@ -38,6 +39,11 @@ class Account:
         self._np_cache: Dict[str, np.ndarray] = {}
         self._symbol_index: List[str] = []
         self._np_dirty: bool = True
+        self._default_leverage = float(self.default_leverage)
+        if self._default_leverage <= 0:
+            raise ValueError("default_leverage must be positive")
+        self._symbol_leverage: Dict[str, float] = {}
+        self._hedge_mode: bool = self.hedge_mode
 
     # ------------ internal helpers ------------
     def _invalidate_cache(self) -> None:
@@ -99,6 +105,34 @@ class Account:
     def get_all_positions(self) -> List[Position]:
         return self._positions
 
+    def get_symbol_leverage(self, symbol: str) -> float:
+        return self._symbol_leverage.get(symbol, self._default_leverage)
+
+    def is_hedge_mode(self) -> bool:
+        """Check if account is in hedge mode.
+        
+        Returns:
+            True if hedge mode is enabled, False for one-way mode.
+        """
+        return self._hedge_mode
+
+    def set_position_mode(self, hedge_mode: bool) -> bool:
+        """Set trading mode: one-way (False) or hedge (True).
+        
+        Cannot switch mode if positions are open.
+        
+        Args:
+            hedge_mode: True for hedge mode, False for one-way mode.
+            
+        Returns:
+            True if mode was changed successfully, False if positions exist.
+        """
+        if self._positions:
+            # Cannot switch mode with open positions
+            return False
+        self._hedge_mode = hedge_mode
+        return True
+
     def snapshot(self) -> AccountSnapshot:
         unreal = self.total_unrealized_pnl()
         return AccountSnapshot(
@@ -127,7 +161,6 @@ class Account:
         fill_qty: float,
         fill_price: float,
         is_long: bool,
-        lev: float,
         fee_rate: float,
     ) -> bool:
         """
@@ -135,6 +168,7 @@ class Account:
         Enforce tier max leverage and initial margin requirement.
         """
         notional = fill_qty * fill_price
+        lev = self.get_symbol_leverage(symbol)
         mmr, max_lev = get_tier_info(notional)
         if lev > max_lev:
             # reject opening due to leverage cap
@@ -182,17 +216,13 @@ class Account:
             tgt.initial_margin += init_margin
             tgt.maintenance_margin += maint_margin
             tgt.fee += fee
+            tgt.leverage = lev
 
         self._invalidate_cache()
         return True
 
-    def adjust_symbol_leverage(self, symbol: str, old_lev: float, new_lev: float) -> bool:
-        """Rebalance margin for existing positions when leverage changes.
-
-        Returns True if adjustment succeeded or there was nothing to do.
-        Mimics C++ adjust_position_leverage semantics.
-        """
-        if new_lev <= 0:
+    def set_symbol_leverage(self, symbol: str, leverage: float) -> bool:
+        if leverage <= 0:
             return False
 
         related: List[Position] = [
@@ -200,6 +230,7 @@ class Account:
             if p.symbol == symbol and p.quantity > 1e-12
         ]
         if not related:
+            self._symbol_leverage[symbol] = float(leverage)
             return True
 
         total_diff = 0.0
@@ -207,9 +238,9 @@ class Account:
         new_maint: List[float] = []
         for p in related:
             mmr, max_lev = get_tier_info(p.notional)
-            if new_lev > max_lev:
+            if leverage > max_lev:
                 return False
-            target_initial = p.notional / new_lev
+            target_initial = p.notional / leverage
             total_diff += target_initial - p.initial_margin
             new_initial.append(target_initial)
             new_maint.append(p.notional * mmr)
@@ -227,10 +258,24 @@ class Account:
         for p, init_val, maint_val in zip(related, new_initial, new_maint):
             p.initial_margin = init_val
             p.maintenance_margin = maint_val
-            p.leverage = new_lev
+            p.leverage = leverage
 
+        self._symbol_leverage[symbol] = float(leverage)
         self._invalidate_cache()
         return True
+
+    def adjust_symbol_leverage(self, symbol: str, old_lev: float, new_lev: float) -> bool:
+        """Rebalance margin for existing positions when leverage changes.
+
+        Returns True if adjustment succeeded or there was nothing to do.
+        Mimics C++ adjust_position_leverage semantics.
+        """
+        current = self._symbol_leverage.get(symbol, self._default_leverage)
+        if symbol not in self._symbol_leverage:
+            self._symbol_leverage[symbol] = float(old_lev)
+        elif abs(current - old_lev) > 1e-12:
+            self._symbol_leverage[symbol] = float(old_lev)
+        return self.set_symbol_leverage(symbol, new_lev)
 
     def reduce_or_close(self, position_id: int, close_qty: float, price: float, fee: float) -> bool:
         """

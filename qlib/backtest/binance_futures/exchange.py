@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .types import Order, Position, FillReport
 from .account import Account
@@ -16,18 +16,21 @@ class ExchangeConfig:
     vip_level: int = 0
     hedge_mode: bool = False
     default_leverage: float = 1.0
-    exec_model: ExecModel = ExecModel()
+    exec_model: ExecModel = field(default_factory=ExecModel)
 
 class Exchange:
     def __init__(self, market_data: Dict[str, pd.DataFrame], cfg: ExchangeConfig):
         self.market = market_data
-        self.account = Account(cfg.init_balance, cfg.vip_level, cfg.hedge_mode)
+        self.account = Account(cfg.init_balance, cfg.vip_level, cfg.hedge_mode, cfg.default_leverage)
         self.cfg = cfg
         self.symbol_leverage: Dict[str, float] = {sym: cfg.default_leverage for sym in market_data.keys()}
         self.open_orders: List[Order] = []
         self._next_order_id: int = 1
         self.cursor: Dict[str, int] = {sym: 0 for sym in market_data.keys()}
         self._now_ts: Optional[int] = None
+
+        for sym, lev in self.symbol_leverage.items():
+            self.account.set_symbol_leverage(sym, lev)
 
     # -------- one-way reverse identical to your C++ idea --------
     def _handle_oneway_reverse(self, symbol: str, quantity: float, price: float, is_long: bool) -> bool:
@@ -108,11 +111,32 @@ class Exchange:
         if abs(current - lev) <= 1e-12:
             return True
 
-        if not self.account.adjust_symbol_leverage(symbol, current, lev):
+        if not self.account.set_symbol_leverage(symbol, lev):
             return False
 
         self.symbol_leverage[symbol] = float(lev)
         return True
+
+    def get_open_orders(self) -> List[Order]:
+        """Get all currently open orders.
+        
+        Returns:
+            List of open Order objects.
+        """
+        return self.open_orders.copy()
+
+    def cancel_order_by_id(self, order_id: int) -> bool:
+        """Cancel an open order by its ID.
+        
+        Args:
+            order_id: Unique identifier of the order to cancel.
+            
+        Returns:
+            True if order was found and cancelled, False otherwise.
+        """
+        initial_len = len(self.open_orders)
+        self.open_orders = [o for o in self.open_orders if o.id != order_id]
+        return len(self.open_orders) < initial_len
 
     # -------- step --------
     def step(self) -> bool:
@@ -177,16 +201,17 @@ class Exchange:
 
                 else:
                     if o.reduce_only:
-                        # NEW: 1:1 C++ behavior — same-side reduction only
+                        # 1:1 C++ behavior — same-side reduction only
+                        # If no position exists, order is discarded (not kept in leftovers)
                         fee = fill_qty * exec_px * fee_rate
                         ok = self.account.reduce_only(o.symbol, o.is_long, fill_qty, exec_px, fee)
                         if not ok:
-                            leftovers.append(o); continue
+                            # reduceOnly failed (no position) => discard order (C++ behavior)
+                            continue
                     else:
-                        lev = self.symbol_leverage.get(o.symbol, 1.0)
                         ok = self.account.open_or_increase(
                             order_id=o.id, symbol=o.symbol, fill_qty=fill_qty, fill_price=exec_px,
-                            is_long=o.is_long, lev=lev, fee_rate=fee_rate
+                            is_long=o.is_long, fee_rate=fee_rate
                         )
                         if not ok:
                             leftovers.append(o); continue
