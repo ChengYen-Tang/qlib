@@ -12,6 +12,7 @@ import pandas as pd
 
 from .data import load_market, align_next_timestamp, slice_bar_snapshot
 from .exchange import Exchange, ExchangeConfig
+from .strategy import SignalRegimeConfig, SignalRegimeExecutor
 from qlib.backtest.report import PortfolioMetrics
 
 StrategyFn = Callable[[int, Dict[str, dict], Exchange], None]
@@ -120,3 +121,25 @@ def run_backtest(
         result["portfolio"] = _build_portfolio_metrics(step_logs, cfg.init_balance, report_freq, benchmark)
 
     return result
+
+
+def run_signal_backtest(
+    symbol_csv: List[Tuple[str, str]],
+    signals: pd.DataFrame,
+    cfg: Optional[ExchangeConfig] = None,
+    regime_config: Optional[SignalRegimeConfig] = None,
+    return_detail: bool = False,
+    report_freq: str = "1min",
+    benchmark: Optional[Union[str, List[str], pd.Series, Dict]] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Run backtest driven by a signal dataframe using the regime executor."""
+
+    executor = SignalRegimeExecutor(signals, config=regime_config)
+    return run_backtest(
+        symbol_csv,
+        strategy=executor,
+        cfg=cfg,
+        return_detail=return_detail,
+        report_freq=report_freq,
+        benchmark=benchmark,
+    )
