@@ -10,16 +10,108 @@ Multi-symbol drive:
 """
 
 from __future__ import annotations
+import numpy as np
 import pandas as pd
 from typing import Dict, Iterable, Tuple
 
 CSV_COLUMNS = [
-    "open_ts", "open", "high", "low", "close",
-    "volume", "close_ts", "quote_volume", "trades",
-    "taker_base", "taker_quote",
+    "open_ts",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_ts",
+    "quote_volume",
+    "trades",
+    "taker_base",
+    "taker_quote",
 ]
 
-KEEP_COLUMNS = ["open", "high", "low", "close", "volume", "quote_volume", "trades", "taker_base", "taker_quote", "ts"]
+KEEP_COLUMNS = [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "quote_volume",
+    "trades",
+    "taker_base",
+    "taker_quote",
+    "ts",
+]
+
+
+def normalize_symbol_df(df: pd.DataFrame, tz: str = "UTC") -> pd.DataFrame:
+    """Ensure a symbol dataframe has the expected schema used by the exchange."""
+    if df.empty:
+        empty = pd.DataFrame(columns=KEEP_COLUMNS)
+        empty.index = pd.DatetimeIndex([], tz="UTC")
+        return empty
+
+    norm = df.copy()
+
+    def _series_to_array(series: pd.Series | np.ndarray) -> np.ndarray:
+        if isinstance(series, pd.Series):
+            arr = pd.to_numeric(series, errors="coerce").to_numpy(dtype="float64")
+        else:
+            arr = np.asarray(series, dtype="float64")
+        return arr
+
+    ts_candidates: list[np.ndarray] = []
+
+    if "open_ts" in norm.columns:
+        ts_candidates.append(_series_to_array(norm["open_ts"]))
+    if "ts" in norm.columns:
+        ts_candidates.append(_series_to_array(norm["ts"]))
+    if isinstance(norm.index, pd.DatetimeIndex):
+        idx = norm.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        ts_candidates.append((idx.view("int64") // 1_000_000).astype("float64"))
+
+    if not ts_candidates:
+        raise ValueError("symbol dataframe must contain 'open_ts'/'ts' column or datetime index")
+
+    ts_array = ts_candidates[0]
+    for candidate in ts_candidates[1:]:
+        if candidate.shape != ts_array.shape:
+            continue
+        mask = ~np.isnan(candidate)
+        ts_array[mask] = candidate[mask]
+
+    if np.isnan(ts_array).any():
+        raise ValueError("timestamp column contains NaN values")
+
+    norm["open_ts"] = ts_array.copy()
+    norm["ts"] = ts_array.astype("int64")
+
+    if isinstance(norm.index, pd.DatetimeIndex):
+        idx = norm.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        idx = idx.tz_convert(tz)
+    else:
+        utc_index = pd.to_datetime(norm["ts"].to_numpy(), unit="ms", utc=True)
+        idx = utc_index.tz_convert(tz)
+    norm.index = pd.DatetimeIndex(idx)
+    norm.index.name = None
+
+    numeric_cols = [c for c in KEEP_COLUMNS if c != "ts"]
+    for col in numeric_cols:
+        if col in norm.columns:
+            norm[col] = pd.to_numeric(norm[col], errors="coerce")
+
+    norm = norm.sort_values(by="ts")
+    missing = [c for c in KEEP_COLUMNS if c not in norm.columns]
+    for col in missing:
+        norm[col] = 0.0 if col != "ts" else norm["ts"]
+
+    return norm[KEEP_COLUMNS].copy()
 
 def read_symbol_csv(path: str, tz: str = "UTC") -> pd.DataFrame:
     """
@@ -27,16 +119,7 @@ def read_symbol_csv(path: str, tz: str = "UTC") -> pd.DataFrame:
     Returns a DataFrame indexed by datetime, with a 'ts' (ms) column for fast use.
     """
     df = pd.read_csv(path, names=CSV_COLUMNS, header=0)
-    # Ensure numeric dtypes
-    num_cols = [c for c in CSV_COLUMNS if c not in ("open_ts", "close_ts")]
-    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
-
-    # Sort by open_ts and build index
-    df = df.sort_values("open_ts")
-    dt = pd.to_datetime(df["open_ts"], unit="ms", utc=True)
-    df.index = dt.tz_convert(tz)
-    df["ts"] = df["open_ts"].astype("int64")
-    return df[KEEP_COLUMNS].copy()
+    return normalize_symbol_df(df, tz=tz)
 
 def load_market(symbol_csv: Iterable[Tuple[str, str]]) -> Dict[str, pd.DataFrame]:
     """

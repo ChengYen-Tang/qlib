@@ -43,4 +43,5 @@ class FillReport:
     price: float
     fee: float
     is_close: bool
+    is_long: bool
     ts: int

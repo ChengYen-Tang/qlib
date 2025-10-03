@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from .types import Order, Position, FillReport
 from .account import Account
 from .config import get_fee_rates
-from .data import align_next_timestamp, slice_bar_snapshot
+from .data import align_next_timestamp, slice_bar_snapshot, normalize_symbol_df
 from .pricing import ExecModel, price_for_market, price_for_crossed_limit
 
 import pandas as pd
@@ -20,17 +20,64 @@ class ExchangeConfig:
 
 class Exchange:
     def __init__(self, market_data: Dict[str, pd.DataFrame], cfg: ExchangeConfig):
-        self.market = market_data
+        normalized_market = {sym: normalize_symbol_df(df) for sym, df in market_data.items()}
+        self.market = normalized_market
         self.account = Account(cfg.init_balance, cfg.vip_level, cfg.hedge_mode, cfg.default_leverage)
         self.cfg = cfg
-        self.symbol_leverage: Dict[str, float] = {sym: cfg.default_leverage for sym in market_data.keys()}
+        self.symbol_leverage: Dict[str, float] = {
+            sym: cfg.default_leverage for sym in normalized_market.keys()
+        }
         self.open_orders: List[Order] = []
         self._next_order_id: int = 1
-        self.cursor: Dict[str, int] = {sym: 0 for sym in market_data.keys()}
+        self.cursor: Dict[str, int] = {sym: 0 for sym in normalized_market.keys()}
         self._now_ts: Optional[int] = None
+        self._step_logs: List[Dict[str, float]] = []
+        self._fills_by_step: List[Tuple[int, List[FillReport]]] = []
+        self._cum_turnover: float = 0.0
+        self._cum_cost: float = 0.0
 
         for sym, lev in self.symbol_leverage.items():
             self.account.set_symbol_leverage(sym, lev)
+
+    # -------- reporting helpers --------
+    def get_step_logs(self) -> pd.DataFrame:
+        """Return per-step account ledger including turnover and costs."""
+        if not self._step_logs:
+            return pd.DataFrame(columns=[
+                "ts",
+                "balance",
+                "unreal_pnl",
+                "equity",
+                "used_margin",
+                "step_turnover",
+                "step_cost",
+                "total_turnover",
+                "total_cost",
+            ])
+        df = pd.DataFrame(self._step_logs)
+        df.index = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        return df
+
+    def get_fill_reports(self) -> pd.DataFrame:
+        """Return all trade fills captured during the backtest."""
+        records: List[Dict[str, float | int | bool]] = []
+        for ts, fills in self._fills_by_step:
+            for fill in fills:
+                records.append({
+                    "ts": ts,
+                    "order_id": fill.order_id,
+                    "symbol": fill.symbol,
+                    "qty": fill.qty,
+                    "price": fill.price,
+                    "fee": fill.fee,
+                    "is_close": fill.is_close,
+                    "is_long": fill.is_long,
+                })
+        if not records:
+            return pd.DataFrame(columns=["ts", "order_id", "symbol", "qty", "price", "fee", "is_close", "is_long"])
+        df = pd.DataFrame(records)
+        df.index = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        return df
 
     # -------- one-way reverse identical to your C++ idea --------
     def _handle_oneway_reverse(self, symbol: str, quantity: float, price: float, is_long: bool) -> bool:
@@ -118,22 +165,11 @@ class Exchange:
         return True
 
     def get_open_orders(self) -> List[Order]:
-        """Get all currently open orders.
-        
-        Returns:
-            List of open Order objects.
-        """
+        """Get all currently open orders."""
         return self.open_orders.copy()
 
     def cancel_order_by_id(self, order_id: int) -> bool:
-        """Cancel an open order by its ID.
-        
-        Args:
-            order_id: Unique identifier of the order to cancel.
-            
-        Returns:
-            True if order was found and cancelled, False otherwise.
-        """
+        """Cancel an open order by its ID."""
         initial_len = len(self.open_orders)
         self.open_orders = [o for o in self.open_orders if o.id != order_id]
         return len(self.open_orders) < initial_len
@@ -147,6 +183,9 @@ class Exchange:
         snap, self.cursor = slice_bar_snapshot(ts, self.cursor, self.market)
 
         mtm_price: Dict[str, float] = {}
+        fills_this_step: List[FillReport] = []
+        step_turnover = 0.0
+        step_cost = 0.0
         for sym, bar in snap.items():
             if bar is None:
                 continue
@@ -179,63 +218,107 @@ class Exchange:
 
             for o in eligible:
                 if remain <= 1e-12:
-                    leftovers.append(o); continue
+                    leftovers.append(o)
+                    continue
 
-                is_market = (o.price <= 0.0)
+                is_market = o.price <= 0.0
                 fee_rate = taker_fee if is_market else maker_fee
                 exec_px = (
                     price_for_market(bar, self.cfg.exec_model.market)
-                    if is_market else
-                    price_for_crossed_limit(bar, self.cfg.exec_model.limit, o.price)
+                    if is_market
+                    else price_for_crossed_limit(bar, self.cfg.exec_model.limit, o.price)
                 )
 
                 fill_qty = min(o.quantity, remain)
                 if fill_qty <= 1e-12:
-                    leftovers.append(o); continue
+                    leftovers.append(o)
+                    continue
+
+                notional = fill_qty * exec_px
+                executed = False
+                fee = 0.0
 
                 if o.closing_position_id >= 0:
-                    fee = fill_qty * exec_px * fee_rate
-                    ok = self.account.reduce_or_close(o.closing_position_id, fill_qty, exec_px, fee)
-                    if not ok:
-                        leftovers.append(o); continue
-
+                    fee = notional * fee_rate
+                    if self.account.reduce_or_close(o.closing_position_id, fill_qty, exec_px, fee):
+                        executed = True
+                    else:
+                        leftovers.append(o)
+                        continue
                 else:
                     if o.reduce_only:
-                        # 1:1 C++ behavior — same-side reduction only
-                        # If no position exists, order is discarded (not kept in leftovers)
-                        fee = fill_qty * exec_px * fee_rate
-                        ok = self.account.reduce_only(o.symbol, o.is_long, fill_qty, exec_px, fee)
-                        if not ok:
+                        fee = notional * fee_rate
+                        if not self.account.reduce_only(o.symbol, o.is_long, fill_qty, exec_px, fee):
                             # reduceOnly failed (no position) => discard order (C++ behavior)
                             continue
+                        executed = True
                     else:
-                        ok = self.account.open_or_increase(
-                            order_id=o.id, symbol=o.symbol, fill_qty=fill_qty, fill_price=exec_px,
-                            is_long=o.is_long, fee_rate=fee_rate
+                        fee = notional * fee_rate
+                        if not self.account.open_or_increase(
+                            order_id=o.id,
+                            symbol=o.symbol,
+                            fill_qty=fill_qty,
+                            fill_price=exec_px,
+                            is_long=o.is_long,
+                            fee_rate=fee_rate,
+                        ):
+                            leftovers.append(o)
+                            continue
+                        executed = True
+
+                if executed:
+                    fills_this_step.append(
+                        FillReport(
+                            order_id=o.id,
+                            symbol=o.symbol,
+                            qty=fill_qty,
+                            price=exec_px,
+                            fee=fee,
+                            is_close=(o.closing_position_id >= 0) or o.reduce_only,
+                            is_long=o.is_long,
+                            ts=ts,
                         )
-                        if not ok:
-                            leftovers.append(o); continue
+                    )
+                    remain -= fill_qty
+                    o.quantity -= fill_qty
+                    step_turnover += notional
+                    step_cost += fee
+                    if o.quantity > 1e-12:
+                        leftovers.append(o)
 
-                remain -= fill_qty
-                o.quantity -= fill_qty
-                if o.quantity > 1e-12:
-                    leftovers.append(o)
-
-            # keep non-eligible + leftovers
             still_open: List[Order] = []
             eligible_ids = {o.id for o in eligible}
             leftover_map = {o.id: o for o in leftovers}
             for o in self.open_orders:
                 if o.symbol != sym:
-                    still_open.append(o); continue
+                    still_open.append(o)
+                    continue
                 if o.id not in eligible_ids:
-                    still_open.append(o); continue
+                    still_open.append(o)
+                    continue
                 if o.id in leftover_map:
                     still_open.append(leftover_map[o.id])
             self.open_orders = still_open
 
-        # MTM + liquidations
         self.account.mark_to_market(mtm_price)
         self.account.check_liquidation()
+
+        snapshot = self.account.snapshot()
+        self._cum_turnover += step_turnover
+        self._cum_cost += step_cost
+        self._step_logs.append(
+            {
+                "ts": ts,
+                "balance": snapshot.balance,
+                "unreal_pnl": snapshot.unreal_pnl,
+                "equity": snapshot.equity,
+                "used_margin": snapshot.used_margin,
+                "step_turnover": step_turnover,
+                "step_cost": step_cost,
+                "total_turnover": self._cum_turnover,
+                "total_cost": self._cum_cost,
+            }
+        )
+        self._fills_by_step.append((ts, fills_this_step))
         return True
     

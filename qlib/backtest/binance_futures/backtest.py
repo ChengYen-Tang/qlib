@@ -7,19 +7,80 @@ A minimal driver that connects:
 """
 
 from __future__ import annotations
-from typing import Callable, Dict, Tuple, List, Optional
+from typing import Callable, Dict, Tuple, List, Optional, Union
 import pandas as pd
 
 from .data import load_market, align_next_timestamp, slice_bar_snapshot
 from .exchange import Exchange, ExchangeConfig
+from qlib.backtest.report import PortfolioMetrics
 
 StrategyFn = Callable[[int, Dict[str, dict], Exchange], None]
 # signature: (bar_ts_ms, snapshot_by_symbol, exchange) -> None
 # user strategy inspects snapshot & uses exchange.place_order/close_position
 
-def run_backtest(symbol_csv: List[Tuple[str, str]],
-                 strategy: StrategyFn,
-                 cfg: Optional[ExchangeConfig] = None) -> Dict[str, pd.DataFrame]:
+def _normalize_benchmark_config(benchmark: Optional[Union[str, List[str], pd.Series, Dict]]) -> Optional[dict]:
+    if benchmark is None:
+        return None
+    if isinstance(benchmark, dict):
+        return benchmark
+    return {"benchmark": benchmark}
+
+
+def _build_portfolio_metrics(
+    step_logs: pd.DataFrame,
+    init_balance: float,
+    freq: str,
+    benchmark: Optional[Union[str, List[str], pd.Series, Dict]] = None,
+) -> pd.DataFrame:
+    if step_logs.empty:
+        return PortfolioMetrics(freq=freq, benchmark_config=_normalize_benchmark_config(benchmark)).generate_portfolio_metrics_dataframe()
+
+    pm = PortfolioMetrics(freq=freq, benchmark_config=_normalize_benchmark_config(benchmark))
+    last_account_value = float(init_balance)
+    last_total_turnover = 0.0
+    last_total_cost = 0.0
+
+    for ts, row in step_logs.iterrows():
+        account_value = float(row["equity"])
+        cash = float(row["balance"])
+        total_turnover = float(row["total_turnover"])
+        total_cost = float(row["total_cost"])
+        step_turnover = total_turnover - last_total_turnover
+        step_cost = total_cost - last_total_cost
+        denom = last_account_value if abs(last_account_value) > 1e-12 else 1.0
+        return_rate = ((account_value - last_account_value) + step_cost) / denom
+        turnover_rate = step_turnover / denom
+        cost_rate = step_cost / denom
+        stock_value = account_value - cash
+
+        pm.update_portfolio_metrics_record(
+            trade_start_time=ts,
+            account_value=account_value,
+            cash=cash,
+            return_rate=return_rate,
+            total_turnover=total_turnover,
+            turnover_rate=turnover_rate,
+            total_cost=total_cost,
+            cost_rate=cost_rate,
+            stock_value=stock_value,
+            bench_value=0.0,
+        )
+
+        last_account_value = account_value
+        last_total_turnover = total_turnover
+        last_total_cost = total_cost
+
+    return pm.generate_portfolio_metrics_dataframe()
+
+
+def run_backtest(
+    symbol_csv: List[Tuple[str, str]],
+    strategy: StrategyFn,
+    cfg: Optional[ExchangeConfig] = None,
+    return_detail: bool = False,
+    report_freq: str = "1min",
+    benchmark: Optional[Union[str, List[str], pd.Series, Dict]] = None,
+) -> Dict[str, pd.DataFrame]:
     """
     Run a backtest with the provided strategy.
     Returns dict of logs (placeholder here; extend for Qlib Recorder/parquet).
@@ -29,7 +90,6 @@ def run_backtest(symbol_csv: List[Tuple[str, str]],
     ex = Exchange(market, cfg)
 
     cursor = {sym: 0 for sym in market.keys()}
-    logs_equity: List[Tuple[int, float, float, float]] = []  # ts, balance, unreal, equity
 
     while True:
         ts = align_next_timestamp(cursor, market)
@@ -45,10 +105,18 @@ def run_backtest(symbol_csv: List[Tuple[str, str]],
         if not advanced:
             break
 
-        # Simple account log (balance/unreal/equity) per bar
-        acc = ex.account.snapshot()
-        logs_equity.append((ts, acc.balance, acc.unreal_pnl, acc.equity))
+    step_logs = ex.get_step_logs()
+    if step_logs.empty:
+        account_df = pd.DataFrame(columns=["balance", "unreal_pnl", "equity"])
+    else:
+        account_df = step_logs[["balance", "unreal_pnl", "equity"]].copy()
+    account_df.index.name = "datetime"
 
-    log_df = pd.DataFrame(logs_equity, columns=["ts", "balance", "unreal_pnl", "equity"])
-    log_df.index = pd.to_datetime(log_df["ts"], unit="ms", utc=True)
-    return {"account": log_df[["balance", "unreal_pnl", "equity"]]}
+    result: Dict[str, pd.DataFrame] = {"account": account_df}
+
+    if return_detail:
+        result["step"] = step_logs.copy()
+        result["fills"] = ex.get_fill_reports()
+        result["portfolio"] = _build_portfolio_metrics(step_logs, cfg.init_balance, report_freq, benchmark)
+
+    return result
